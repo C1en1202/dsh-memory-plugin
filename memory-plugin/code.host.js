@@ -1,7 +1,17 @@
-// 长期记忆抽取器 —— Dynamic Cordis Plugin 的 Host 半区（code.host）
+// 长期记忆抽取器 v2 —— Dynamic Cordis Plugin 的 Host 半区（code.host）
 // 说明：这个文件的内容就是 cordis_define 的 code.host 参数（函数体）。
 // 纯 JS，不使用 import/require/JSX/TS。运行时沙箱只暴露 ctx / harness / console / btoa / atob / TextEncoder / TextDecoder。
 // 记忆存储在工作区根目录的 MEMORY.md，跨会话、跨进程持久；插件本身是进程级的（重启后需重新 define/run）。
+//
+// v2 新增：自动抽取。监听消息事件，命中触发词时自动写入记忆（带去重）。
+// 注意：MESSAGE_EVENT 的事件名与 payload 形状必须先经 cordis_inspect_query → Event.listEvents 确认真实接口；
+// 事件名不存在时监听器不会触发（无害），但也不会自动抽取。
+
+// ===== v2 配置 =====
+const AUTO_EXTRACT = true // false 可关闭自动抽取，只保留手动工具
+const MESSAGE_EVENT = 'message/send' // TODO: 替换为 Event.listEvents 查到的真实"消息"事件名
+const TRIGGERS = ['记住', '偏好', '习惯', '约定', '教训', '以后都', 'remember', 'preference', 'lesson']
+
 return {
   name: 'memory-extractor',
 
@@ -56,18 +66,24 @@ return {
       return lines.join('\n')
     }
 
-    // 写入一条记忆
-    async function remember(category, rawText, signal) {
+    // 写入一条记忆；dedupe=true 时对相同 (类别, 文本) 跳过
+    async function remember(category, rawText, signal, dedupe) {
       const text = String(rawText || '').replace(/\s+/g, ' ').trim()
       if (!text) return { ok: false, error: 'text 为空' }
       const cat = HEADERS[category] ? category : 'fact'
       const target = await ensureFile(signal)
       const current = await fs.readText(target, signal)
+      if (dedupe) {
+        const entries = parseEntries(current)
+        if (entries.some((e) => e.category === cat && e.text === text)) {
+          return { ok: true, skipped: true, category: cat, text, total: entries.length }
+        }
+      }
       const date = new Date().toISOString().slice(0, 10)
       const next = appendEntryText(current, cat, { date, text })
       await fs.writeText(target, next, undefined, signal)
       const entries = parseEntries(next)
-      return { ok: true, category: cat, text, total: entries.length }
+      return { ok: true, skipped: false, category: cat, text, total: entries.length }
     }
 
     // 检索记忆：query 为空 = 列出全部
@@ -103,6 +119,9 @@ return {
         schema: { type: 'json' },
         render(args, value) {
           if (value.ok) {
+            if (value.skipped) {
+              return [{ type: 'text', text: `已存在相同条目，跳过（${value.category}，共 ${value.total} 条）` }]
+            }
             return [{ type: 'text', text: `已记住（${value.category}，共 ${value.total} 条）：${value.text}` }]
           }
           return [{ type: 'text', text: `记忆写入失败：${value.error}` }]
@@ -110,7 +129,7 @@ return {
       },
       async execute(args, exec) {
         try {
-          return await remember(args.category, args.text, exec.signal)
+          return await remember(args.category, args.text, exec.signal, false)
         } catch (err) {
           return { ok: false, error: String((err && err.message) || err) }
         }
@@ -154,5 +173,33 @@ return {
     // 注册属于本插件 Fiber 的动态工具；插件停止/更新时自动注销
     ctx.effect(() => harness.registerTool(ctx, rememberDef))
     ctx.effect(() => harness.registerTool(ctx, searchDef))
+
+    // ===== v2：自动抽取 =====
+    if (AUTO_EXTRACT) {
+      const offAuto = ctx.on(MESSAGE_EVENT, (payload) => {
+        // 防御式取文本：payload 可能是字符串、{ text }、{ content } 或 { content: 块数组 }
+        let raw = ''
+        if (typeof payload === 'string') {
+          raw = payload
+        } else if (payload) {
+          const t = payload.text || payload.content || payload.message
+          if (typeof t === 'string') raw = t
+          else if (Array.isArray(t)) raw = t.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join(' ')
+        }
+        const text = String(raw).trim()
+        if (!text) return
+        const hit = TRIGGERS.find((t) => text.includes(t))
+        if (!hit) return
+        // 抽取：去掉触发词及其之前的内容，再清理开头标点
+        const idx = text.indexOf(hit)
+        const cleaned =
+          (idx >= 0 ? text.slice(idx + hit.length) : text)
+            .replace(/^[\s:：,，。.;；]+/, '')
+            .trim() || text
+        const cat = text.includes('约定') ? 'convention' : text.includes('教训') ? 'lesson' : 'fact'
+        remember(cat, cleaned, undefined, true).catch((err) => console.error('auto-remember failed', err))
+      })
+      ctx.effect(() => offAuto)
+    }
   },
 }
